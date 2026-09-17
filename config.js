@@ -12,6 +12,6 @@
 // own Supabase project (Project Settings -> API).
 
 window.MTT_CONFIG = {
-  SUPABASE_URL: "https://YOUR-PROJECT-REF.supabase.co",
-  SUPABASE_ANON_KEY: "YOUR-ANON-PUBLIC-KEY",
+  SUPABASE_URL: "https://zhwtnzmzcbkjdwmjvgzg.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_xPcpPV0tsrpxkjx7Og5Ilw_nuWRKdbM",
 };
