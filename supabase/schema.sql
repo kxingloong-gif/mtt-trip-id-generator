@@ -112,6 +112,39 @@ create index if not exists opportunities_created_at_idx
   on public.opportunities (created_at desc);
 
 -- ---------------------------------------------------------------------
+-- 3a. OPPORTUNITY ID FORMAT SAFEGUARD
+--
+-- Opportunity IDs must always be exactly 8 characters: "M" + a
+-- 2-digit Malaysia-local year + a 5-digit zero-padded sequence, e.g.
+-- "M2600001". This CHECK constraint enforces that shape at the
+-- database level, as a second safeguard alongside the application
+-- logic in generate_opportunity_id() below.
+--
+-- It is added with NOT VALID and wrapped in a "does it already exist"
+-- check so this file stays safely re-runnable on a database that was
+-- already set up with an earlier schema version. NOT VALID means it
+-- is enforced for every new insert or update from now on, but does
+-- NOT immediately re-check any rows already in the table - so this
+-- statement cannot fail even if older test records were created in a
+-- previous ID format (e.g. "MTT26-000123"). See the README for how to
+-- fully validate the constraint once any old-format rows are cleared.
+-- ---------------------------------------------------------------------
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'opportunities_id_format_chk'
+      and conrelid = 'public.opportunities'::regclass
+  ) then
+    alter table public.opportunities
+      add constraint opportunities_id_format_chk
+      check (opportunity_id ~ '^M[0-9]{7}$')
+      not valid;
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
 -- 4. GENERATE OPPORTUNITY ID (concurrency-safe RPC function)
 --
 -- How the numbering stays safe when two people click "Generate" at the
@@ -136,6 +169,13 @@ create index if not exists opportunities_created_at_idx
 -- still 31 December in UTC. `created_at` itself stays a plain
 -- `timestamptz`, which always stores the correct instant regardless of
 -- timezone - only the year/prefix calculation below is shifted.
+--
+-- ID format note: the Opportunity ID must be exactly 8 characters -
+-- "M" + 2-digit year + 5-digit sequence, e.g. "M2600001" - to stay
+-- compatible with another internal system that caps this reference at
+-- 8 characters. That means at most 99,999 IDs per calendar year. The
+-- check below stops a 100,000th ID for the same year from ever being
+-- created, rather than silently producing a 9-character ID.
 -- ---------------------------------------------------------------------
 create or replace function public.generate_opportunity_id(p_description text)
 returns public.opportunities
@@ -176,7 +216,16 @@ begin
   do update set last_number = public.opportunity_sequences.last_number + 1
   returning last_number into v_seq;
 
-  v_opportunity_id := 'MTT' || v_yy || '-' || lpad(v_seq::text, 6, '0');
+  -- Safeguard: the ID format only has room for a 5-digit sequence
+  -- (max 99999 per year). Stop here rather than ever building an ID
+  -- longer than 8 characters. The counter above has already advanced,
+  -- so this sequence number is permanently burned and skipped - it is
+  -- never reused, consistent with voided IDs never being reused either.
+  if v_seq > 99999 then
+    raise exception 'Annual Opportunity ID limit (99999) reached for year %. Contact your administrator.', v_year;
+  end if;
+
+  v_opportunity_id := 'M' || v_yy || lpad(v_seq::text, 5, '0');
 
   insert into public.opportunities (
     opportunity_id, sequence_year, sequence_number,
@@ -285,5 +334,8 @@ grant execute on function public.is_active_user() to authenticated;
 --   - Tables profiles, opportunity_sequences, opportunities exist.
 --   - Functions is_admin, is_active_user, generate_opportunity_id,
 --     void_opportunity exist.
+--   - Constraint opportunities_id_format_chk exists on opportunities.
 --   - "Success. No rows returned" is shown in the SQL Editor.
+--   - New IDs generated after this point look like "M2600001" (8
+--     characters), not the older "MTT26-000123" style.
 -- =====================================================================

@@ -4,14 +4,20 @@ A small internal web app for Masenang Tours & Travel (MTT) that generates a
 unique, sequential **Opportunity ID** for every genuine sales opportunity,
 and keeps a permanent audit register of every ID ever issued.
 
-The generated ID (e.g. `MTT26-000123`) is combined with a short description
-and copied into Odoo's Opportunity Name field. This app does **not** replace
+The generated ID (e.g. `M2600001`) is combined with a short description and
+copied into Odoo's Opportunity Name field. This app does **not** replace
 Odoo — Odoo remains the CRM. This app only issues IDs and keeps the audit
 trail.
 
 ```
-MTT26-000123 | 4 Days 3 Nights Kundasang and Kota Kinabalu Tour
+M2600001 | 4 Days 3 Nights Kundasang and Kota Kinabalu Tour
 ```
+
+The Opportunity ID itself (`M2600001`) is always exactly **8 characters**,
+with no hyphens, spaces, or other punctuation, so it fits an internal
+system that only accepts an 8-character reference. The `|` separator and
+description are part of the combined "Odoo Opportunity Name" only — never
+part of the ID itself.
 
 ---
 
@@ -20,7 +26,8 @@ MTT26-000123 | 4 Days 3 Nights Kundasang and Kota Kinabalu Tour
 - Consultants log in with their own email/password.
 - They type an Opportunity Description and click **Generate ID**.
 - The database (never the browser) issues the next sequential ID for the
-  current calendar year, in the format `MTTYY-XXXXXX`.
+  current calendar year, in the format `MYYNNNNN` (8 characters: `M` + a
+  2-digit year + a 5-digit sequence).
 - The app shows the combined "ID | Description" string with a **Copy for
   Odoo** button.
 - Everyone can see and search the register of IDs already issued.
@@ -197,19 +204,30 @@ ID** calls a database function, `generate_opportunity_id()`, which:
    runs. If two consultants click Generate at the same instant, Postgres
    processes them one after another — they can never receive the same
    number.
-3. Builds the ID as `MTT` + two-digit year + `-` + the number padded to 6
-   digits, e.g. `MTT26-000123`.
+3. Builds the ID as `M` + two-digit year + the number padded to 5 digits,
+   e.g. `M2600123` (always exactly 8 characters, no hyphens).
 4. Inserts the new record into the `opportunities` table.
 
-A `UNIQUE` constraint on the ID column, and another on
-`(sequence_year, sequence_number)`, is a second safety net that would
-reject any accidental duplicate outright.
+A `UNIQUE` constraint on the ID column, another on
+`(sequence_year, sequence_number)`, and a `CHECK` constraint requiring the
+ID to match the 8-character `M` + 7-digit pattern are all extra safety
+nets that would reject any accidental duplicate or malformed ID outright.
 
 Because the year is read from the current date automatically, the
-sequence naturally starts again at `000001` on 1 January each year — there
+sequence naturally starts again at `00001` on 1 January each year — there
 is no scheduled job needed.
 
 Voided records keep their number forever, so numbers are never reused.
+
+### Why at most 99,999 IDs per year
+
+The 5-digit sequence has room for `00001` to `99999` — 99,999 IDs per
+calendar year. Since this is a small internal app expecting at most a few
+thousand opportunities a year, that ceiling is not expected to be reached
+in practice. If it ever were, `generate_opportunity_id()` deliberately
+raises an error on the 100,000th attempt for that year rather than ever
+producing a 9-character ID that the other internal system couldn't accept.
+That skipped number is never reused, the same as a voided ID.
 
 ### Timezone: the year always follows Malaysia local time
 
@@ -228,10 +246,10 @@ v_yy := to_char(now() at time zone 'Asia/Kuala_Lumpur', 'YY');
 ```
 
 So the very first ID generated after midnight Malaysia time on 1 January
-already uses the new year, e.g. `MTT27-000001`. The `created_at` column
-is unaffected — it stays a normal UTC `timestamptz`, which always
-represents the correct moment in time regardless of timezone; only the
-year/prefix used to build the ID is shifted to Malaysia time.
+already uses the new year, e.g. `M2700001`. The `created_at` column is
+unaffected — it stays a normal UTC `timestamptz`, which always represents
+the correct moment in time regardless of timezone; only the year/prefix
+used to build the ID is shifted to Malaysia time.
 
 ## 10. Row Level Security — what each rule means
 
@@ -345,7 +363,76 @@ the audit trail. Signups are disabled deliberately (section 6).
 No. See section 9 — the database serializes concurrent requests, so both
 get distinct, correct numbers.
 
-## 17. Security notes
+**"Annual Opportunity ID limit (99999) reached for year ..."**
+That calendar year has already issued the maximum 99,999 IDs the
+8-character format allows (section 9). This is not expected in normal
+use for this app's scale — if you see it, double check nothing is
+generating IDs in a loop, then contact your developer.
+
+**I see old `MTT26-000123`-style IDs mixed with new `M2600001`-style
+IDs in the register.**
+Expected if you generated any records before running the updated
+`schema.sql` (see section 17). Old records keep their original ID
+permanently — IDs are never edited retroactively — while every ID
+generated from now on uses the new 8-character format.
+
+## 17. Upgrading an existing database to the 8-character ID format
+
+If you already ran an earlier version of `supabase/schema.sql` (issuing
+IDs like `MTT26-000123`), here is exactly what changes and what you need
+to do.
+
+**What changed:**
+- `generate_opportunity_id()` now builds IDs as `M` + 2-digit year +
+  5-digit sequence (e.g. `M2600001`) instead of `MTT` + year + `-` +
+  6-digit sequence.
+- A new `opportunities_id_format_chk` constraint enforces that every
+  *new or edited* row's `opportunity_id` matches this 8-character shape.
+- A new safeguard stops generation once a year's sequence would exceed
+  99,999.
+
+**What did NOT change:** the `opportunities` and `opportunity_sequences`
+tables, their columns, the uniqueness constraints, RLS policies, and the
+admin-only `void_opportunity()` function are all exactly as before. No
+table is dropped or recreated, and no existing row is touched.
+
+**Is a migration step required?**
+
+- **Re-running `schema.sql` is safe** even though you already ran an
+  earlier version — every statement uses `create or replace`,
+  `if not exists`, or the same guarded pattern used for the new
+  constraint, so it won't fail or duplicate anything.
+- **The new format constraint uses `NOT VALID`**, specifically so this
+  is true even if your database already contains rows in the old
+  `MTT26-000123` shape (for example, from your own testing). `NOT VALID`
+  means: enforced for every row created or edited from now on, but it
+  does not go back and re-check rows that are already there, so running
+  this file cannot fail because of old test data.
+- **You do not have to do anything else** for the app to keep working —
+  from your next `Generate ID` click onward, every new record will use
+  the 8-character format automatically.
+- **Optional cleanup, only if you have old-format test records you don't
+  need to keep:** since this app never allows deleting records, the only
+  ways to deal with old-format rows are to (a) leave them exactly as they
+  are — the app will display and search them fine alongside new-format
+  records, they're just a different shape — or (b) void them via the
+  admin **Void** button, which does not remove them but does mark them
+  clearly as no longer active. Real production records should never be
+  removed from the register regardless of format.
+- **Optional strict validation:** once you're satisfied no row violates
+  the new format (e.g. you've voided or accepted any old-format test
+  rows), you can ask the constraint to fully check every existing row by
+  running this once in the SQL Editor:
+  ```sql
+  alter table public.opportunities
+    validate constraint opportunities_id_format_chk;
+  ```
+  Expected result: "Success. No rows returned" if every row already
+  matches the 8-character format, or an error naming the first
+  non-matching `opportunity_id` if not (in which case leave the
+  constraint as-is — it still protects all new rows either way).
+
+## 18. Security notes
 
 - Never put the `service_role` key or your database password in any file
   in this repository.
@@ -357,7 +444,7 @@ get distinct, correct numbers.
   functions — not in the JavaScript code. Even if someone bypassed the
   UI entirely and called the Supabase API directly, the same rules apply.
 
-## 18. Out of scope for this version
+## 19. Out of scope for this version
 
 This app intentionally does **not** include CRM features, quotation or
 costing tools, supplier/invoice management, or profitability dashboards.
