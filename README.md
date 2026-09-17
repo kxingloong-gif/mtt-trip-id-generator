@@ -211,12 +211,40 @@ is no scheduled job needed.
 
 Voided records keep their number forever, so numbers are never reused.
 
+### Timezone: the year always follows Malaysia local time
+
+Supabase's database server runs in UTC internally. If the year were taken
+directly from the server clock, an Opportunity ID generated between
+00:00 and 07:59 UTC on 1 January (which is already 1 January, 08:00+ in
+Malaysia) would be fine, but one generated late on 31 December UTC that
+is already past midnight in Malaysia (UTC+8) would wrongly get the old
+year. To avoid this, `generate_opportunity_id()` converts "now" into
+`Asia/Kuala_Lumpur` time before reading the year and the two-digit `YY`
+prefix:
+
+```sql
+v_year := extract(year from (now() at time zone 'Asia/Kuala_Lumpur'))::int;
+v_yy := to_char(now() at time zone 'Asia/Kuala_Lumpur', 'YY');
+```
+
+So the very first ID generated after midnight Malaysia time on 1 January
+already uses the new year, e.g. `MTT27-000001`. The `created_at` column
+is unaffected — it stays a normal UTC `timestamptz`, which always
+represents the correct moment in time regardless of timezone; only the
+year/prefix used to build the ID is shifted to Malaysia time.
+
 ## 10. Row Level Security — what each rule means
 
 - **profiles**: you can only see your own profile, unless you're an
   admin (admins can see everyone's).
-- **opportunities — read**: any logged-in user can see every record. This
-  is a shared register, not private to each consultant.
+- **opportunities — read**: any logged-in user whose `profiles.active`
+  is `true` can see every record. This is a shared register, not
+  private to each consultant. If an admin deactivates a user (section
+  7), that user immediately loses read access to the register as well
+  as the ability to generate new IDs, even though their Supabase Auth
+  login still technically exists. This check is done through the
+  `is_active_user()` SECURITY DEFINER helper function so the policy can
+  read `profiles` without the same policy recursively checking itself.
 - **opportunities — create/edit/delete**: nobody, not even admins, can
   insert, edit, or delete rows in this table directly. The *only* way a
   row can be created is through `generate_opportunity_id()`, and the

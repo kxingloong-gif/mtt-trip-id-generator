@@ -61,6 +61,24 @@ as $$
   );
 $$;
 
+-- Helper: is the currently logged-in user an active profile (consultant
+-- or admin)? Used to gate read access to the opportunity register.
+-- SECURITY DEFINER for the same reason as is_admin() above - it lets
+-- the policy check profiles.active without RLS on profiles recursing
+-- back into itself.
+create or replace function public.is_active_user()
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and active = true
+  );
+$$;
+
 -- ---------------------------------------------------------------------
 -- 2. SEQUENCE COUNTER (one row per calendar year)
 -- Never exposed to the browser. Only the generate_opportunity_id()
@@ -110,6 +128,14 @@ create index if not exists opportunities_created_at_idx
 -- opportunities even though ordinary logged-in users have no direct
 -- write access to those tables (see the RLS policies further down).
 -- This is the ONLY path by which a new Opportunity ID can be created.
+--
+-- Timezone note: Supabase servers run in UTC. The sequence year and
+-- the "YY" prefix must reflect Malaysia local time (Asia/Kuala_Lumpur,
+-- UTC+8) so that an ID generated just after midnight on 1 January in
+-- Malaysia immediately rolls over to the new year, even though it is
+-- still 31 December in UTC. `created_at` itself stays a plain
+-- `timestamptz`, which always stores the correct instant regardless of
+-- timezone - only the year/prefix calculation below is shifted.
 -- ---------------------------------------------------------------------
 create or replace function public.generate_opportunity_id(p_description text)
 returns public.opportunities
@@ -138,8 +164,11 @@ begin
     raise exception 'Opportunity description is required';
   end if;
 
-  v_year := extract(year from now())::int;
-  v_yy := to_char(now(), 'YY');
+  -- Convert "now" (an instant in time) into Malaysia local time before
+  -- reading the year, so the calendar year and prefix are correct from
+  -- 00:00 Asia/Kuala_Lumpur on 1 January, not 00:00 UTC.
+  v_year := extract(year from (now() at time zone 'Asia/Kuala_Lumpur'))::int;
+  v_yy := to_char(now() at time zone 'Asia/Kuala_Lumpur', 'YY');
 
   insert into public.opportunity_sequences (sequence_year, last_number)
   values (v_year, 1)
@@ -217,8 +246,11 @@ create policy profiles_select on public.profiles
   for select
   using (id = auth.uid() or public.is_admin());
 
--- opportunities: any logged-in user may read every record (the
--- register is shared across all consultants and admins).
+-- opportunities: any logged-in user whose profile is still active may
+-- read every record (the register is shared across all consultants
+-- and admins). A deactivated user's login still exists in Supabase
+-- Auth, but once profiles.active is set to false they lose read access
+-- to the register along with the ability to generate new IDs.
 -- Deliberately no INSERT, UPDATE or DELETE policy exists for any role
 -- here - that makes the table's rows immutable to direct client
 -- access. Records can only be created via generate_opportunity_id()
@@ -227,7 +259,7 @@ create policy profiles_select on public.profiles
 drop policy if exists opportunities_select on public.opportunities;
 create policy opportunities_select on public.opportunities
   for select
-  using (auth.uid() is not null);
+  using (public.is_active_user());
 
 -- opportunity_sequences: no policies at all. No one - consultant or
 -- admin - can read or write this table directly from the browser.
@@ -245,9 +277,13 @@ grant execute on function public.void_opportunity(text, text) to authenticated;
 
 revoke execute on function public.is_admin() from public, anon;
 grant execute on function public.is_admin() to authenticated;
+
+revoke execute on function public.is_active_user() from public, anon;
+grant execute on function public.is_active_user() to authenticated;
 -- =====================================================================
 -- Expected result after running this file:
 --   - Tables profiles, opportunity_sequences, opportunities exist.
---   - Functions is_admin, generate_opportunity_id, void_opportunity exist.
+--   - Functions is_admin, is_active_user, generate_opportunity_id,
+--     void_opportunity exist.
 --   - "Success. No rows returned" is shown in the SQL Editor.
 -- =====================================================================
