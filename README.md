@@ -1,39 +1,60 @@
-# MTT Opportunity ID Generator
+# MTT Trip ID Generator
 
 A small internal web app for Masenang Tours & Travel (MTT) that generates a
-unique, sequential **Opportunity ID** for every genuine sales opportunity,
-and keeps a permanent audit register of every ID ever issued.
+unique, sequential, and permanent **Trip ID** (also called an Opportunity
+ID) for every confirmed trip, and keeps a permanent audit register of every
+ID ever issued — including every proposed change to it and who approved or
+rejected that change.
 
 The generated ID (e.g. `M2600001`) is combined with a short description and
 copied into Odoo's Opportunity Name field. This app does **not** replace
-Odoo — Odoo remains the CRM. This app only issues IDs and keeps the audit
-trail.
+Odoo — Odoo remains the CRM. This app only issues IDs, runs a controlled
+amendment/void approval workflow, and keeps the audit trail.
 
 ```
 M2600001 | 4 Days 3 Nights Kundasang and Kota Kinabalu Tour
 ```
 
-The Opportunity ID itself (`M2600001`) is always exactly **8 characters**,
-with no hyphens, spaces, or other punctuation, so it fits an internal
-system that only accepts an 8-character reference. The `|` separator and
-description are part of the combined "Odoo Opportunity Name" only — never
-part of the ID itself.
+The Trip ID itself (`M2600001`) is always exactly **8 characters**, with no
+hyphens, spaces, or other punctuation, so it fits an internal system that
+only accepts an 8-character reference. The `|` separator and description
+are part of the combined "Odoo Opportunity Name" only — never part of the
+ID itself. **The Trip ID never changes, is never reused, and is never
+deleted, no matter what happens to the description or the booking.**
+
+For how Consultants and Supervisors actually use the app day-to-day
+(including when to generate a Trip ID, how to request an amendment, and
+the difference between Cancelled and Void), see
+**[CONSULTANT_SUPERVISOR_MANUAL.md](CONSULTANT_SUPERVISOR_MANUAL.md)**.
+This README is the technical/admin document.
 
 ---
 
 ## 1. What this app does
 
-- Consultants log in with their own email/password.
-- They type an Opportunity Description and click **Generate ID**.
-- The database (never the browser) issues the next sequential ID for the
-  current calendar year, in the format `MYYNNNNN` (8 characters: `M` + a
-  2-digit year + a 5-digit sequence).
+- Users log in with their own email/password as a **Consultant**,
+  **Supervisor**, or **Admin**.
+- A Consultant types a Trip Description and clicks **Generate ID** — the
+  normal trigger for this is a deposit being received (see the user
+  manual). The database (never the browser) issues the next sequential ID
+  for the current calendar year, in the format `MYYNNNNN` (8 characters:
+  `M` + a 2-digit year + a 5-digit sequence).
 - The app shows the combined "ID | Description" string with a **Copy for
   Odoo** button.
 - Everyone can see and search the register of IDs already issued.
-- Admins can void a record (with a mandatory reason) and export the whole
-  register to CSV. Nothing is ever deleted, and no ID or sequence number is
-  ever reused, even if voided.
+- The description can later be corrected through a **Request Amendment**
+  workflow: a Consultant (or Supervisor, for their own record) proposes a
+  new description with a reason; a Supervisor or Admin must approve it
+  before it takes effect. The Trip ID itself never changes.
+- A record created in error can be corrected through the same kind of
+  **Request Void** workflow, again requiring Supervisor/Admin approval.
+- A genuine booking that the customer later cancels is marked
+  **Cancelled** by a Supervisor or Admin directly — kept clearly distinct
+  from **Void** (which means the ID should never have existed at all).
+- Admins can still void a record directly and immediately, as in the
+  original version of this app, and can export the register (and the full
+  amendment/void history) to CSV. Nothing is ever deleted, and no ID or
+  sequence number is ever reused.
 
 ## 2. Architecture
 
@@ -44,8 +65,11 @@ GitHub Pages  (static index.html / app.js / style.css - no build step)
       |
 Supabase Free (cloud)
       +-- Authentication   (email/password logins, created by an admin)
-      +-- PostgreSQL       (profiles, opportunities, opportunity_sequences)
-      +-- SQL functions    (generate_opportunity_id, void_opportunity)
+      +-- PostgreSQL       (profiles, opportunities, opportunity_sequences,
+      |                     opportunity_requests)
+      +-- SQL functions    (generate_opportunity_id, void_opportunity,
+      |                     request_amendment, request_void,
+      |                     review_request, cancel_opportunity)
       +-- Row Level Security (enforces every permission rule above)
 ```
 
@@ -58,8 +82,9 @@ free Supabase project.
 
 Supabase gives the browser a public **anon key**. That key alone cannot
 read or change anything — every table has **Row Level Security (RLS)**
-turned on, and IDs are only ever created or voided through two special
-SQL functions that check permissions themselves. See section 9 for exactly
+turned on, and every write to a Trip ID record goes through one of the SQL
+functions listed above, each of which checks permissions itself. See
+section 9 (numbering) and section 11 (amendment/void workflow) for exactly
 how.
 
 ## 3. Files in this repository
@@ -68,9 +93,10 @@ how.
 |---|---|
 | `index.html` | The whole page (login screen + main app) |
 | `style.css` | Plain, minimal styling |
-| `app.js` | All app logic (login, generate, search, void, CSV export) |
+| `app.js` | All app logic (login, generate, amend/void requests, approvals, cancel, search, CSV export) |
 | `config.js` | Your Supabase Project URL and anon key (safe to commit — see section 8) |
-| `supabase/schema.sql` | The complete database setup — tables, functions, RLS. Run this once in Supabase |
+| `supabase/schema.sql` | The complete database setup — tables, functions, RLS. Safely re-runnable; run this in Supabase every time this repo's schema changes |
+| `CONSULTANT_SUPERVISOR_MANUAL.md` | Plain-language day-to-day usage guide for Consultants and Supervisors (not technical) |
 
 ## 4. Setting up your Supabase project
 
@@ -110,9 +136,16 @@ how.
    was only partly pasted.
 
 This creates:
-- `profiles`, `opportunities`, `opportunity_sequences` tables
-- The `generate_opportunity_id()` and `void_opportunity()` functions
+- `profiles`, `opportunities`, `opportunity_sequences`,
+  `opportunity_requests` tables
+- The `generate_opportunity_id()`, `void_opportunity()`,
+  `request_amendment()`, `request_void()`, `review_request()`, and
+  `cancel_opportunity()` functions
 - All Row Level Security policies
+
+If you already ran an earlier version of this file, running it again is
+safe — see section 7 (Roles) and the upgrade notes near the end of this
+document for exactly what changes and why nothing is destroyed.
 
 ## 6. Configuring Authentication
 
@@ -153,6 +186,14 @@ set full_name = 'Felicia Tan'
 where id = (select id from auth.users where email = 'felicia@example.com');
 ```
 
+### Promote a user to supervisor
+
+```sql
+update public.profiles
+set role = 'supervisor'
+where id = (select id from auth.users where email = 'supervisor@example.com');
+```
+
 ### Promote a user to admin
 
 ```sql
@@ -160,6 +201,17 @@ update public.profiles
 set role = 'admin'
 where id = (select id from auth.users where email = 'admin@example.com');
 ```
+
+### Roles at a glance
+
+| Role | Can do |
+|---|---|
+| Consultant | Generate Trip IDs, request amendments/voids for their own records, view/search the register, view their own request history |
+| Supervisor | Everything a Consultant can, plus: review (approve/reject) a Consultant's amendment/void requests, mark a trip Cancelled |
+| Admin | Everything a Supervisor can, plus: review a Supervisor's (or another Admin's) requests, void a record directly and immediately, export CSVs, promote/deactivate users |
+
+A Supervisor or Admin can never approve their own amendment or void
+request — see section 11.
 
 ### Deactivate a user (blocks them from generating IDs, without deleting history)
 
@@ -275,8 +327,99 @@ used to build the ID is shifted to Malaysia time.
   from the browser, ever.
 - **Logged-out visitors**: have no policies granting them anything, so
   they cannot read or write any business data.
+- **opportunity_requests**: you can see your own requests; a Supervisor
+  or Admin can see everyone's (so they can act on the approval queue).
+  Like `opportunities`, there is no INSERT/UPDATE/DELETE policy for any
+  role — every row is created and updated only by `request_amendment()`,
+  `request_void()`, and `review_request()`, described next.
 
-## 11. Local development
+## 11. The amendment / void request workflow
+
+The Trip ID itself is never editable by anyone, in any role. What *can*
+change, with approval, is the description. This app never lets a
+Consultant, Supervisor, or Admin directly overwrite the approved
+description or directly flip a record to Void — every such change goes
+through a request that a different, authorised person must approve.
+
+### How a request moves through the system
+
+1. A Consultant (or a Supervisor/Admin, for their own record) calls
+   `request_amendment()` or `request_void()`. This only inserts a new row
+   into `opportunity_requests` with `status = 'Pending'` — the approved
+   description and the record's status are completely untouched at this
+   point.
+2. A Supervisor or Admin opens the **Pending Amendment / Void Requests**
+   list and reviews the proposed change.
+3. They call `review_request()` with a decision of `Approve` or `Reject`.
+   - **Approve** an Amendment: `opportunities.current_description` and
+     `full_odoo_name` are updated to the proposed text. The Trip ID
+     (`opportunity_id`) is never touched.
+   - **Approve** a Void: `opportunities.status` becomes `'Void'`, with
+     the same `void_reason` / `voided_by` / `voided_at` fields the
+     original Admin-only void has always used.
+   - **Reject**: nothing about the trip changes. A rejection reason is
+     mandatory and is stored permanently.
+4. Either way, the request row itself is updated (never deleted) with who
+   reviewed it, when, and the outcome — this is the permanent audit trail
+   for every proposed change, approved or not.
+
+### Self-approval control (enforced in the database, not just the UI)
+
+`review_request()` refuses the call outright if `auth.uid()` (the person
+calling it) is the same person who submitted the request — this applies
+to every role, including an Admin reviewing their own request. On top of
+that, who is *allowed* to review depends on the **requester's** role:
+
+| Requester's role | Who may review |
+|---|---|
+| Consultant | Supervisor or Admin |
+| Supervisor | Admin only |
+| Admin | Admin only (and never themselves) |
+
+**What this means if your Supabase project only has one Admin account:**
+if that Admin submits an amendment or void request for their own record,
+nobody can approve it — the single self-approval check has no other
+Admin to satisfy, so the request stays `Pending` indefinitely. This is
+the deliberate, fail-closed default: "an Admin must never approve their
+own change" is only a real security control if there is genuinely no way
+around it, including for Admins. The practical fix is simple and free on
+Supabase: **create a second Admin account** (Authentication -> Users ->
+Add user, then promote with the SQL in section 7) before this situation
+comes up — even one held by a second trusted person who rarely logs in is
+enough. There is no special "backup approver" bypass built into this app,
+by design.
+
+### Only one open request per Trip ID at a time
+
+A unique database index (`opportunity_requests_one_pending_idx`) means a
+second amendment or void request cannot be submitted for a Trip ID while
+one is already `Pending`. The consultant sees "Request pending" instead
+of the request buttons until the existing one is resolved.
+
+## 12. Cancellation vs Void
+
+These are deliberately different, both in meaning and in who can do them:
+
+- **Cancelled** — a genuine, previously valid trip that the customer
+  backed out of after confirming. The record stays exactly as it was,
+  just marked Cancelled with a reason, by whom, and when
+  (`cancel_reason` / `cancelled_by` / `cancelled_at`). This is a direct
+  action available to a Supervisor or Admin (`cancel_opportunity()`) —
+  it does not go through the approval queue, since it is recording a
+  real-world outcome rather than correcting a mistake. A Consultant
+  cannot call this function.
+- **Void** — the Trip ID itself should never have existed (e.g. an
+  accidental duplicate, or created for the wrong booking). A Consultant
+  or Supervisor can only *request* a void (`request_void()`), which then
+  needs Supervisor/Admin (or Admin-only, per the table above) approval
+  through `review_request()`. An Admin retains the original, unchanged
+  ability to void a record directly and immediately via
+  `void_opportunity()`, exactly as in the first version of this app.
+
+Neither Cancelled nor Void ever deletes a record, changes its Trip ID, or
+frees up its sequence number for reuse.
+
+## 13. Local development
 
 You don't need Node.js, npm, or a build step — this is plain HTML/CSS/JS.
 
@@ -292,7 +435,7 @@ You don't need Node.js, npm, or a build step — this is plain HTML/CSS/JS.
 (Opening `index.html` directly with `file://` will not work correctly
 because the browser blocks ES module imports over `file://`.)
 
-## 12. Deploying to GitHub Pages
+## 14. Deploying to GitHub Pages
 
 1. Push this repository to GitHub (with your real `config.js` values
    committed — see section 8 for why that's safe).
@@ -306,37 +449,89 @@ because the browser blocks ES module imports over `file://`.)
 Any time you push a new commit to that branch, GitHub Pages redeploys
 automatically.
 
-## 13. How to use the application
+## 15. How to use the application (all roles)
 
 1. Open the app's URL and log in with your email and password.
-2. Type a description of the opportunity, e.g. "4 Days 3 Nights Kundasang
-   and Kota Kinabalu Tour".
-3. Click **Generate ID**. The button disables itself while working, so
-   you can't accidentally create two IDs by double-clicking.
+2. Type a description of the trip, e.g. "4 Days 3 Nights Kundasang and
+   Kota Kinabalu Tour", and click **Generate ID** — normally only after a
+   deposit is received (see the user manual for the full business rule).
+3. The button disables itself while working, so you can't accidentally
+   create two IDs by double-clicking.
 4. The generated ID and the combined "ID | Description" string appear.
 5. Click **Copy for Odoo**, then paste that text into Odoo's Opportunity
    Name field.
-6. Use the search box under "Recent Opportunity IDs" to find a record by
-   ID, description, or the name of the person who created it.
+6. Use the search box under "Trip ID Register" to find a record by ID,
+   description, or the name of the person who created it.
 
-## 14. How to void a record (admin only)
+## 16. How to request an amendment or void (Consultant / Supervisor)
+
+1. In the Trip ID Register, find a record you created (status must still
+   be Active).
+2. Click **Request Amendment** to propose a new description (enter both
+   the proposed text and a reason), or **Request Void** if the record was
+   created in error (enter a reason). Both fields are mandatory.
+3. The request appears with status "Pending" both in your own **My
+   Amendment / Void Requests** list and in the reviewer's approval queue.
+   The current approved description is completely unchanged while it
+   waits.
+4. Once a Supervisor or Admin reviews it, your **My Amendment / Void
+   Requests** row updates to Approved or Rejected, along with who
+   reviewed it, when, and (if rejected) why.
+5. If an amendment was approved, the Trip ID Register and the **Copy for
+   Odoo** name now reflect the new description — copy it and update the
+   existing Odoo opportunity.
+
+## 17. How to review pending requests (Supervisor / Admin)
+
+1. After logging in, a banner shows how many requests are awaiting your
+   review (if any).
+2. Open **Pending Amendment / Void Requests**. Each row shows the Trip
+   ID, request type, current description, proposed description (if an
+   amendment), the reason, and who requested it and when.
+3. Click **Review** to open the full detail, then **Approve** or
+   **Reject**. Rejecting requires a short reason, which is shown to the
+   requester and stored permanently.
+4. If the request is your own, no **Review** button appears — see section
+   11 for why, including what to do if you are the only Admin.
+
+## 18. How to mark a trip Cancelled (Supervisor / Admin)
+
+1. Find the Active record in the Trip ID Register and click **Cancel**.
+2. Enter a cancellation reason (required) and confirm.
+3. The record now shows status "Cancelled" with the reason. It remains in
+   the register permanently — this is different from Void (section 12).
+
+## 19. How to void a record directly (Admin only)
+
+This is the original, unchanged direct-void capability from the first
+version of this app — an immediate action with no approval queue.
 
 1. Log in as an admin.
-2. Find the record in the table and click its **Void** button.
+2. Find the record in the table and click its **Admin Void** button.
 3. Enter a reason (required) and click **Confirm Void**.
 4. The record now shows status "Void" with the reason next to it. It
    remains in the register permanently, and its ID/number will never be
    reused.
 
-## 15. How to export the register to CSV (admin only)
+For the request-based void that Consultants and Supervisors use instead,
+see section 16.
+
+## 20. How to export CSVs (Admin only)
 
 1. Log in as an admin.
-2. Click **Export CSV** near the top of the page.
-3. Your browser downloads a file named like
-   `mtt-opportunity-register-2026-09-17.csv`, containing every record
-   (Active and Void) with all audit fields.
+2. Click **Export Trip Register CSV** for the main register (Trip ID,
+   current approved description, full Odoo name, created by/at, status,
+   and all void/cancel audit fields).
+3. Click **Export Amendment/Void History CSV** for the separate history
+   of every request ever submitted — old description, proposed
+   description, reason, status, requested/reviewed by and when, and any
+   rejection reason.
+4. Your browser downloads files named like
+   `mtt-trip-register-2026-09-19.csv` and
+   `mtt-amendment-void-history-2026-09-19.csv`, containing every record
+   (Active, Cancelled, and Void) with all audit fields.
 
-## 16. Troubleshooting
+## 21. Troubleshooting
 
 **"Your account is not active. Contact your administrator."**
 Your `profiles.active` value is `false`, or your profile row wasn't
@@ -347,7 +542,7 @@ Open the browser console (F12) and look for an error. A common cause is
 `config.js` still containing the placeholder URL/key — double check
 section 4.
 
-**"Failed to generate Opportunity ID: User account is not active"**
+**"Failed to generate Trip ID: User account is not active"**
 Same as above — an admin needs to set `active = true` for that user.
 
 **Clicking Generate does nothing / shows a permissions error.**
@@ -372,11 +567,77 @@ generating IDs in a loop, then contact your developer.
 **I see old `MTT26-000123`-style IDs mixed with new `M2600001`-style
 IDs in the register.**
 Expected if you generated any records before running the updated
-`schema.sql` (see section 17). Old records keep their original ID
-permanently — IDs are never edited retroactively — while every ID
-generated from now on uses the new 8-character format.
+`schema.sql`. Old records keep their original ID permanently — IDs are
+never edited retroactively — while every ID generated from now on uses
+the new 8-character format.
 
-## 17. Upgrading an existing database to the 8-character ID format
+**"You cannot review your own request."**
+Working as intended — see section 11. Ask a different Supervisor or
+Admin to review it. If you are the only Admin and the request is yours,
+see section 11 for why it will stay Pending until a second Admin account
+exists.
+
+**"Only an admin may review a supervisor request" / "...an admin
+request".**
+Working as intended — a Supervisor's or Admin's own amendment/void
+request can only be approved by an Admin, never by a Supervisor. See the
+table in section 11.
+
+**A Consultant doesn't see Request Amendment / Request Void buttons on a
+record.**
+Those buttons only appear on records that user created themselves, while
+status is still Active, and only when there is no request already
+Pending for that record (see "Only one open request per Trip ID" in
+section 11).
+
+**Request Amendment / Request Void fails with "Trip ID record not
+found" or "you may only request... for a Trip ID you created".**
+The RPC functions check `created_by = auth.uid()` in the database, not
+just in the UI — this is expected if someone attempts the call for a
+record they did not create.
+
+## 22. Upgrade notes (schema history)
+
+This section explains what changed each time `supabase/schema.sql` was
+revised, and confirms every revision is safe to re-run over a database
+that already has an earlier version. Nothing described below drops a
+table, deletes a row, or requires you to recreate your Supabase project.
+
+### A. Amendment/Approval workflow, Supervisor role, Cancelled status (this revision)
+
+**What changed:**
+- `profiles.role` now also accepts `'supervisor'`.
+- `opportunities.status` now also accepts `'Cancelled'`.
+- New `opportunities` columns: `current_description` (the live approved
+  description — `original_description` is now a permanent, never-changed
+  record of what was typed at creation), `cancel_reason`, `cancelled_by`,
+  `cancelled_at`.
+- New table `opportunity_requests` holds every amendment/void request
+  ever submitted, approved, or rejected.
+- New functions: `is_supervisor()`, `request_amendment()`,
+  `request_void()`, `review_request()`, `cancel_opportunity()`.
+
+**What did NOT change:** `generate_opportunity_id()`'s ID format and
+concurrency safety, the `opportunity_id` uniqueness/format constraints,
+`void_opportunity()` (Admin's direct void is exactly as before), and
+every existing RLS policy that was already there.
+
+**Is a migration step required?** No manual step. Re-running
+`schema.sql` is safe:
+- The role and status CHECK constraints are widened with
+  `drop constraint if exists` + `add constraint`, which never touches
+  row data — every existing `'consultant'`/`'admin'` role and
+  `'Active'`/`'Void'` status value already satisfies the wider
+  constraint.
+- `current_description` is added as a nullable column, backfilled from
+  `original_description` for every existing row, and only then set
+  `NOT NULL` — so every existing Trip ID keeps working and displays its
+  existing description immediately, with nothing to do on your part.
+- The new cancellation columns and the new `opportunity_requests` table
+  use `add column if not exists` / `create table if not exists`, so
+  running the file again after this point is a harmless no-op.
+
+### B. 8-character ID format (previous revision)
 
 If you already ran an earlier version of `supabase/schema.sql` (issuing
 IDs like `MTT26-000123`), here is exactly what changes and what you need
@@ -432,21 +693,28 @@ table is dropped or recreated, and no existing row is touched.
   non-matching `opportunity_id` if not (in which case leave the
   constraint as-is — it still protects all new rows either way).
 
-## 18. Security notes
+## 23. Security notes
 
 - Never put the `service_role` key or your database password in any file
   in this repository.
 - The `.gitignore` file excludes `.env` files in case you add
   environment-specific secrets later, though this app currently needs
   none beyond the public values in `config.js`.
-- All real security enforcement (who can read what, who can write what)
-  lives in Supabase's Row Level Security policies and the two SQL
-  functions — not in the JavaScript code. Even if someone bypassed the
-  UI entirely and called the Supabase API directly, the same rules apply.
+- All real security enforcement (who can read what, who can write what,
+  who can approve what) lives in Supabase's Row Level Security policies
+  and the SQL functions in `supabase/schema.sql` — not in the JavaScript
+  code. Even if someone bypassed the UI entirely and called the Supabase
+  API directly, the same rules apply, including the self-approval and
+  reviewer-authority checks inside `review_request()`.
 
-## 19. Out of scope for this version
+## 24. Out of scope for this version
 
 This app intentionally does **not** include CRM features, quotation or
 costing tools, supplier/invoice management, or profitability dashboards.
-It only generates controlled IDs and maintains their audit register.
-Future integration with the Monthly Statistic Report may be added later.
+It only generates controlled Trip IDs, runs the amendment/void approval
+workflow, and maintains their audit register. It also does not
+technically enforce the "deposit received" rule for generating a Trip
+ID — that is an operating rule documented in
+`CONSULTANT_SUPERVISOR_MANUAL.md`, since Odoo remains responsible for
+tracking enquiry/quotation/confirmation stages. Future integration with
+the Monthly Statistic Report may be added later.

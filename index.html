@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>MTT Opportunity ID Generator</title>
+<title>MTT Trip ID Generator</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
 <header>
-  <h1>MTT Opportunity ID Generator</h1>
+  <h1>MTT Trip ID Generator</h1>
 </header>
 
 <!-- ==================== LOGIN SCREEN ==================== -->
@@ -34,15 +34,19 @@
     <button id="logout-button">Logout</button>
   </div>
 
+  <p id="pending-banner" class="banner hidden"></p>
+
   <section id="generate-section">
-    <h2>Generate Opportunity ID</h2>
-    <label for="description">Opportunity Description</label>
+    <h2>Generate Trip ID</h2>
+    <p class="hint">Generate a Trip ID only after a deposit is received (or a
+      management-approved formal confirmation) - see the user manual.</p>
+    <label for="description">Trip / Opportunity Description</label>
     <textarea id="description" rows="2" placeholder="e.g. 4 Days 3 Nights Kundasang and Kota Kinabalu Tour"></textarea>
     <button id="generate-button">Generate ID</button>
     <p id="generate-error" class="error" role="alert"></p>
 
     <div id="result-box" class="hidden">
-      <p class="label">Generated Opportunity ID</p>
+      <p class="label">Generated Trip ID</p>
       <p id="result-id" class="result-id"></p>
 
       <p class="label">Complete Odoo Opportunity Name</p>
@@ -54,22 +58,43 @@
   </section>
 
   <section id="admin-export-section" class="hidden">
-    <button id="export-csv-button">Export CSV</button>
+    <button id="export-csv-button">Export Trip Register CSV</button>
+    <button id="export-requests-csv-button">Export Amendment/Void History CSV</button>
+  </section>
+
+  <section id="approval-section" class="hidden">
+    <h2>Pending Amendment / Void Requests</h2>
+    <table id="approval-table">
+      <thead>
+        <tr>
+          <th>Trip ID</th>
+          <th>Type</th>
+          <th>Current Description</th>
+          <th>Proposed Description</th>
+          <th>Reason</th>
+          <th>Requested By</th>
+          <th>Requested At</th>
+          <th>Review</th>
+        </tr>
+      </thead>
+      <tbody id="approval-body"></tbody>
+    </table>
+    <p id="approval-status"></p>
   </section>
 
   <section id="register-section">
-    <h2>Recent Opportunity IDs</h2>
-    <input type="text" id="search-input" placeholder="Search by ID, description or creator..." />
+    <h2>Trip ID Register</h2>
+    <input type="text" id="search-input" placeholder="Search by Trip ID, description or creator..." />
 
     <table id="register-table">
       <thead>
         <tr>
-          <th>Opportunity ID</th>
+          <th>Trip ID</th>
           <th>Description</th>
           <th>Created By</th>
           <th>Created At</th>
           <th>Status</th>
-          <th id="admin-void-header" class="hidden">Void</th>
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody id="register-body"></tbody>
@@ -77,18 +102,117 @@
     <p id="register-status"></p>
   </section>
 
+  <section id="my-requests-section">
+    <h2>My Amendment / Void Requests</h2>
+    <table id="my-requests-table">
+      <thead>
+        <tr>
+          <th>Trip ID</th>
+          <th>Type</th>
+          <th>Proposed Description</th>
+          <th>Reason</th>
+          <th>Status</th>
+          <th>Reviewed By</th>
+          <th>Reviewed At</th>
+          <th>Rejection Reason</th>
+        </tr>
+      </thead>
+      <tbody id="my-requests-body"></tbody>
+    </table>
+    <p id="my-requests-status"></p>
+  </section>
+
 </main>
 
-<!-- ==================== VOID DIALOG ==================== -->
+<!-- ==================== REQUEST AMENDMENT DIALOG ==================== -->
+<div id="amend-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Request Amendment - <span id="amend-modal-id"></span></h3>
+    <p class="label">Current Approved Description</p>
+    <p id="amend-current-description"></p>
+    <label for="amend-proposed">Proposed New Description (required)</label>
+    <textarea id="amend-proposed" rows="2"></textarea>
+    <label for="amend-reason">Amendment Reason (required)</label>
+    <textarea id="amend-reason" rows="2"></textarea>
+    <p id="amend-error" class="error" role="alert"></p>
+    <div class="modal-buttons">
+      <button id="amend-submit-button">Submit Request</button>
+      <button id="amend-cancel-button" class="secondary">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== REQUEST VOID DIALOG (Consultant / Supervisor) ==================== -->
+<div id="request-void-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Request Void - <span id="request-void-modal-id"></span></h3>
+    <p class="hint">Use this only if this Trip ID was created in error (e.g.
+      an accidental duplicate). Do not use this for a genuine trip that was
+      later cancelled - use Cancel instead.</p>
+    <label for="request-void-reason">Void Reason (required)</label>
+    <textarea id="request-void-reason" rows="2"></textarea>
+    <p id="request-void-error" class="error" role="alert"></p>
+    <div class="modal-buttons">
+      <button id="request-void-submit-button">Submit Request</button>
+      <button id="request-void-cancel-button" class="secondary">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== REVIEW REQUEST DIALOG (Supervisor / Admin) ==================== -->
+<div id="review-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Review Request - <span id="review-modal-id"></span></h3>
+    <p class="label">Request Type</p>
+    <p id="review-type"></p>
+    <p class="label">Current Approved Description</p>
+    <p id="review-current"></p>
+    <p class="label">Proposed Description</p>
+    <p id="review-proposed"></p>
+    <p class="label">Reason</p>
+    <p id="review-reason"></p>
+    <p class="label">Requested By / At</p>
+    <p id="review-requester"></p>
+
+    <div id="review-reject-box" class="hidden">
+      <label for="review-rejection-reason">Rejection Reason (required)</label>
+      <textarea id="review-rejection-reason" rows="2"></textarea>
+    </div>
+    <p id="review-error" class="error" role="alert"></p>
+    <div class="modal-buttons">
+      <button id="review-approve-button">Approve</button>
+      <button id="review-reject-button" class="secondary">Reject</button>
+      <button id="review-cancel-button" class="secondary">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== ADMIN DIRECT VOID DIALOG ==================== -->
 <div id="void-modal" class="modal hidden">
   <div class="modal-box">
-    <h3>Void Opportunity ID <span id="void-modal-id"></span></h3>
+    <h3>Void Trip ID <span id="void-modal-id"></span> (Admin - immediate)</h3>
     <label for="void-reason">Void Reason (required)</label>
     <textarea id="void-reason" rows="2"></textarea>
     <p id="void-error" class="error" role="alert"></p>
     <div class="modal-buttons">
       <button id="void-confirm-button">Confirm Void</button>
       <button id="void-cancel-button" class="secondary">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== CANCEL DIALOG (Supervisor / Admin) ==================== -->
+<div id="cancel-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Mark Cancelled - <span id="cancel-modal-id"></span></h3>
+    <p class="hint">Use this for a genuine trip that the customer cancelled
+      after confirming. The record remains in the register.</p>
+    <label for="cancel-reason">Cancellation Reason (required)</label>
+    <textarea id="cancel-reason" rows="2"></textarea>
+    <p id="cancel-error" class="error" role="alert"></p>
+    <div class="modal-buttons">
+      <button id="cancel-confirm-button">Confirm Cancellation</button>
+      <button id="cancel-cancel-button" class="secondary">Close</button>
     </div>
   </div>
 </div>

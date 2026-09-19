@@ -111,6 +111,24 @@ th { background: #eee; }
 tr.void-row { color: var(--void); }
 tr.void-row td { text-decoration: line-through; }
 tr.void-row td.no-strike { text-decoration: none; }
+tr.cancelled-row { color: var(--void); }
+
+.hint { color: var(--muted); font-size: 0.85rem; margin: 0.25rem 0 0.5rem; }
+
+.banner {
+  background: #fff3cd;
+  border: 1px solid #e0c46c;
+  padding: 0.5rem 0.75rem;
+  margin: 0 auto 1rem;
+  max-width: 700px;
+  font-weight: bold;
+}
+
+.modal-box { max-width: 480px; }
+.modal-box p:not(.label):not(.hint) { margin: 0.1rem 0 0.5rem; }
+
+.action-buttons { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.action-buttons button { margin-top: 0; }
 
 .modal {
   position: fixed;

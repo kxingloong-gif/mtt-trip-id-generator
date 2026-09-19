@@ -14,10 +14,18 @@
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   full_name text not null,
-  role text not null default 'consultant' check (role in ('consultant', 'admin')),
+  role text not null default 'consultant' check (role in ('consultant', 'supervisor', 'admin')),
   active boolean not null default true,
   created_at timestamptz not null default now()
 );
+
+-- Widen the role check constraint to allow the new 'supervisor' role.
+-- Safe to re-run on a database that already has this table: it only
+-- replaces the constraint definition, never touches any row's data,
+-- and every existing 'consultant'/'admin' value still satisfies it.
+alter table public.profiles drop constraint if exists profiles_role_check;
+alter table public.profiles add constraint profiles_role_check
+  check (role in ('consultant', 'supervisor', 'admin'));
 
 -- Automatically create a profile row whenever an admin creates a new
 -- login in Supabase Authentication. New users start as 'consultant'.
@@ -79,6 +87,22 @@ as $$
   );
 $$;
 
+-- Helper: is the currently logged-in user an active supervisor? Used by
+-- the amendment/void request review rules (a supervisor may review a
+-- consultant's request, but not another supervisor's or an admin's).
+create or replace function public.is_supervisor()
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'supervisor' and active = true
+  );
+$$;
+
 -- ---------------------------------------------------------------------
 -- 2. SEQUENCE COUNTER (one row per calendar year)
 -- Never exposed to the browser. Only the generate_opportunity_id()
@@ -98,13 +122,17 @@ create table if not exists public.opportunities (
   sequence_year int not null,
   sequence_number int not null,
   original_description text not null,
+  current_description text not null,
   full_odoo_name text not null,
   created_by uuid not null references public.profiles(id),
   created_at timestamptz not null default now(),
-  status text not null default 'Active' check (status in ('Active', 'Void')),
+  status text not null default 'Active' check (status in ('Active', 'Cancelled', 'Void')),
   void_reason text,
   voided_by uuid references public.profiles(id),
   voided_at timestamptz,
+  cancel_reason text,
+  cancelled_by uuid references public.profiles(id),
+  cancelled_at timestamptz,
   unique (sequence_year, sequence_number)
 );
 
@@ -112,7 +140,37 @@ create index if not exists opportunities_created_at_idx
   on public.opportunities (created_at desc);
 
 -- ---------------------------------------------------------------------
--- 3a. OPPORTUNITY ID FORMAT SAFEGUARD
+-- 3a. AMENDMENT / CANCELLATION SUPPORT COLUMNS (safe upgrade path)
+--
+-- The three statements below let this file safely upgrade a database
+-- that was already created with an earlier schema version, which had
+-- neither current_description nor the Cancelled status nor the
+-- cancellation columns. On a brand-new database the table above
+-- already has everything, so these are harmless no-ops.
+--
+-- "original_description" is a permanent record of what was typed when
+-- the Trip ID was created and is never changed again. "current_description"
+-- is the live, currently-approved description shown everywhere and used
+-- to build full_odoo_name - it starts out equal to original_description
+-- and only changes when an amendment request is approved.
+-- ---------------------------------------------------------------------
+alter table public.opportunities add column if not exists current_description text;
+alter table public.opportunities add column if not exists cancel_reason text;
+alter table public.opportunities add column if not exists cancelled_by uuid references public.profiles(id);
+alter table public.opportunities add column if not exists cancelled_at timestamptz;
+
+update public.opportunities
+set current_description = original_description
+where current_description is null;
+
+alter table public.opportunities alter column current_description set not null;
+
+alter table public.opportunities drop constraint if exists opportunities_status_check;
+alter table public.opportunities add constraint opportunities_status_check
+  check (status in ('Active', 'Cancelled', 'Void'));
+
+-- ---------------------------------------------------------------------
+-- 3b. OPPORTUNITY ID FORMAT SAFEGUARD
 --
 -- Opportunity IDs must always be exactly 8 characters: "M" + a
 -- 2-digit Malaysia-local year + a 5-digit zero-padded sequence, e.g.
@@ -143,6 +201,47 @@ begin
   end if;
 end;
 $$;
+
+-- ---------------------------------------------------------------------
+-- 3c. AMENDMENT / VOID REQUEST QUEUE
+--
+-- "Request an amendment" and "request a void" are the same workflow
+-- shape - submit, sit as Pending, get Approved or Rejected by a
+-- Supervisor/Admin - so they share one lean table instead of two
+-- near-identical ones. request_type tells them apart. Nothing is ever
+-- deleted from this table: it is the permanent record of every
+-- proposed change and who approved or rejected it.
+-- ---------------------------------------------------------------------
+create table if not exists public.opportunity_requests (
+  id uuid primary key default gen_random_uuid(),
+  trip_row_id uuid not null references public.opportunities(id),
+  request_type text not null check (request_type in ('Amendment', 'Void')),
+  current_description_at_request text not null,
+  proposed_description text,
+  reason text not null,
+  status text not null default 'Pending' check (status in ('Pending', 'Approved', 'Rejected')),
+  requested_by uuid not null references public.profiles(id),
+  requested_at timestamptz not null default now(),
+  reviewed_by uuid references public.profiles(id),
+  reviewed_at timestamptz,
+  rejection_reason text,
+  created_at timestamptz not null default now(),
+  constraint opportunity_requests_amendment_needs_description
+    check (request_type <> 'Amendment' or proposed_description is not null)
+);
+
+create index if not exists opportunity_requests_trip_idx
+  on public.opportunity_requests (trip_row_id);
+
+create index if not exists opportunity_requests_status_idx
+  on public.opportunity_requests (status);
+
+-- Only one open (Pending) request per Trip ID at a time, so a second
+-- amendment or void request can't be submitted while one is already
+-- awaiting review.
+create unique index if not exists opportunity_requests_one_pending_idx
+  on public.opportunity_requests (trip_row_id)
+  where status = 'Pending';
 
 -- ---------------------------------------------------------------------
 -- 4. GENERATE OPPORTUNITY ID (concurrency-safe RPC function)
@@ -229,10 +328,11 @@ begin
 
   insert into public.opportunities (
     opportunity_id, sequence_year, sequence_number,
-    original_description, full_odoo_name, created_by
+    original_description, current_description, full_odoo_name, created_by
   ) values (
     v_opportunity_id, v_year, v_seq,
-    trim(p_description), v_opportunity_id || ' | ' || trim(p_description),
+    trim(p_description), trim(p_description),
+    v_opportunity_id || ' | ' || trim(p_description),
     auth.uid()
   )
   returning * into v_row;
@@ -242,7 +342,10 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------
--- 5. VOID OPPORTUNITY (admin-only RPC function)
+-- 5. VOID OPPORTUNITY (admin-only RPC function, unchanged from v1)
+-- Admin's original direct-void power, preserved exactly as before.
+-- The NEW request-based void path for consultants/supervisors is
+-- request_void() + review_request() further down.
 -- Same SECURITY DEFINER pattern: this is the ONLY path by which a
 -- record's status can change. It never deletes anything.
 -- ---------------------------------------------------------------------
@@ -274,6 +377,280 @@ begin
 
   if v_row.id is null then
     raise exception 'Record not found or already void';
+  end if;
+
+  return v_row;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 5a. REQUEST AMENDMENT
+-- Any active user may request an amendment to a Trip ID they created,
+-- while it is still Active. This never touches the approved
+-- description itself - it only queues a Pending request.
+-- ---------------------------------------------------------------------
+create or replace function public.request_amendment(
+  p_trip_row_id uuid,
+  p_proposed_description text,
+  p_reason text
+)
+returns public.opportunity_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_trip public.opportunities;
+  v_row public.opportunity_requests;
+begin
+  if not public.is_active_user() then
+    raise exception 'User account is not active';
+  end if;
+
+  select * into v_trip from public.opportunities where id = p_trip_row_id;
+  if v_trip.id is null then
+    raise exception 'Trip ID record not found';
+  end if;
+
+  if v_trip.created_by <> auth.uid() then
+    raise exception 'You may only request an amendment for a Trip ID you created';
+  end if;
+
+  if v_trip.status <> 'Active' then
+    raise exception 'Only an Active Trip ID can be amended';
+  end if;
+
+  if p_proposed_description is null or length(trim(p_proposed_description)) = 0 then
+    raise exception 'Proposed description is required';
+  end if;
+
+  if p_reason is null or length(trim(p_reason)) = 0 then
+    raise exception 'Amendment reason is required';
+  end if;
+
+  insert into public.opportunity_requests (
+    trip_row_id, request_type, current_description_at_request,
+    proposed_description, reason, requested_by
+  ) values (
+    p_trip_row_id, 'Amendment', v_trip.current_description,
+    trim(p_proposed_description), trim(p_reason), auth.uid()
+  )
+  returning * into v_row;
+
+  return v_row;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 5b. REQUEST VOID
+-- Same shape as request_amendment(), but for a genuine creation
+-- mistake rather than a description change. Does not touch the
+-- record's status itself - only queues a Pending request.
+-- ---------------------------------------------------------------------
+create or replace function public.request_void(
+  p_trip_row_id uuid,
+  p_reason text
+)
+returns public.opportunity_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_trip public.opportunities;
+  v_row public.opportunity_requests;
+begin
+  if not public.is_active_user() then
+    raise exception 'User account is not active';
+  end if;
+
+  select * into v_trip from public.opportunities where id = p_trip_row_id;
+  if v_trip.id is null then
+    raise exception 'Trip ID record not found';
+  end if;
+
+  if v_trip.created_by <> auth.uid() then
+    raise exception 'You may only request a void for a Trip ID you created';
+  end if;
+
+  if v_trip.status <> 'Active' then
+    raise exception 'Only an Active Trip ID can have a void requested';
+  end if;
+
+  if p_reason is null or length(trim(p_reason)) = 0 then
+    raise exception 'Void reason is required';
+  end if;
+
+  insert into public.opportunity_requests (
+    trip_row_id, request_type, current_description_at_request,
+    proposed_description, reason, requested_by
+  ) values (
+    p_trip_row_id, 'Void', v_trip.current_description,
+    null, trim(p_reason), auth.uid()
+  )
+  returning * into v_row;
+
+  return v_row;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 5c. REVIEW REQUEST (approve or reject a pending amendment/void request)
+--
+-- Self-approval control: a reviewer can never review their own
+-- request, full stop - including an admin reviewing their own request.
+-- Who else is allowed to review depends on the REQUESTER's role, not
+-- the reviewer's:
+--   - Consultant's request  -> Supervisor or Admin may review
+--   - Supervisor's request  -> Admin only may review
+--   - Admin's request       -> Admin only may review, but never the
+--                              same admin. If a project only has one
+--                              admin account, that admin's own requests
+--                              stay Pending forever - see the README
+--                              for why this is the intended, safe
+--                              behaviour rather than a bug.
+-- ---------------------------------------------------------------------
+create or replace function public.review_request(
+  p_request_id uuid,
+  p_decision text,
+  p_rejection_reason text default null
+)
+returns public.opportunity_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_request public.opportunity_requests;
+  v_requester_role text;
+  v_row public.opportunity_requests;
+begin
+  if not public.is_active_user() then
+    raise exception 'User account is not active';
+  end if;
+
+  if p_decision not in ('Approve', 'Reject') then
+    raise exception 'Decision must be Approve or Reject';
+  end if;
+
+  select * into v_request from public.opportunity_requests where id = p_request_id;
+  if v_request.id is null then
+    raise exception 'Request not found';
+  end if;
+
+  if v_request.status <> 'Pending' then
+    raise exception 'This request has already been reviewed';
+  end if;
+
+  if auth.uid() = v_request.requested_by then
+    raise exception 'You cannot review your own request';
+  end if;
+
+  select role into v_requester_role from public.profiles where id = v_request.requested_by;
+
+  if v_requester_role in ('supervisor', 'admin') then
+    if not public.is_admin() then
+      raise exception 'Only an admin may review a % request', v_requester_role;
+    end if;
+  else
+    if not (public.is_admin() or public.is_supervisor()) then
+      raise exception 'Only a supervisor or admin may review this request';
+    end if;
+  end if;
+
+  if p_decision = 'Reject' then
+    if p_rejection_reason is null or length(trim(p_rejection_reason)) = 0 then
+      raise exception 'A rejection reason is required';
+    end if;
+
+    update public.opportunity_requests
+    set status = 'Rejected',
+        reviewed_by = auth.uid(),
+        reviewed_at = now(),
+        rejection_reason = trim(p_rejection_reason)
+    where id = p_request_id
+    returning * into v_row;
+
+    return v_row;
+  end if;
+
+  -- Approve: apply the change, Trip ID itself is never touched.
+  if v_request.request_type = 'Amendment' then
+    update public.opportunities
+    set current_description = v_request.proposed_description,
+        full_odoo_name = opportunity_id || ' | ' || v_request.proposed_description
+    where id = v_request.trip_row_id
+      and status = 'Active';
+
+    if not found then
+      raise exception 'Trip ID is no longer Active and cannot be amended';
+    end if;
+  else
+    update public.opportunities
+    set status = 'Void',
+        void_reason = v_request.reason,
+        voided_by = auth.uid(),
+        voided_at = now()
+    where id = v_request.trip_row_id
+      and status = 'Active';
+
+    if not found then
+      raise exception 'Trip ID is no longer Active and cannot be voided';
+    end if;
+  end if;
+
+  update public.opportunity_requests
+  set status = 'Approved',
+      reviewed_by = auth.uid(),
+      reviewed_at = now()
+  where id = p_request_id
+  returning * into v_row;
+
+  return v_row;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 5d. CANCEL TRIP (Supervisor or Admin only, direct - no approval queue)
+--
+-- Cancellation records a real, previously valid booking that the
+-- customer backed out of. That is operationally different from Void
+-- (which means the ID itself should never have existed), so it is a
+-- direct action by an authorised role rather than a self-approval-
+-- guarded request, the same way Admin's original void_opportunity()
+-- above has always been direct. A Consultant cannot call this.
+-- ---------------------------------------------------------------------
+create or replace function public.cancel_opportunity(
+  p_trip_row_id uuid,
+  p_reason text
+)
+returns public.opportunities
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_row public.opportunities;
+begin
+  if not (public.is_admin() or public.is_supervisor()) then
+    raise exception 'Only a supervisor or admin can mark a Trip ID Cancelled';
+  end if;
+
+  if p_reason is null or length(trim(p_reason)) = 0 then
+    raise exception 'A cancellation reason is required';
+  end if;
+
+  update public.opportunities
+  set status = 'Cancelled',
+      cancel_reason = trim(p_reason),
+      cancelled_by = auth.uid(),
+      cancelled_at = now()
+  where id = p_trip_row_id
+    and status = 'Active'
+  returning * into v_row;
+
+  if v_row.id is null then
+    raise exception 'Trip ID not found or is not currently Active';
   end if;
 
   return v_row;
@@ -313,6 +690,22 @@ create policy opportunities_select on public.opportunities
 -- opportunity_sequences: no policies at all. No one - consultant or
 -- admin - can read or write this table directly from the browser.
 
+alter table public.opportunity_requests enable row level security;
+
+-- opportunity_requests: you can see your own requests; supervisors and
+-- admins can see every request (so they can act on the approval
+-- queue). No INSERT/UPDATE/DELETE policy exists for any role here -
+-- every row is created and updated only by request_amendment(),
+-- request_void() and review_request() above, which enforce ownership,
+-- self-approval and reviewer-authority rules themselves.
+drop policy if exists opportunity_requests_select on public.opportunity_requests;
+create policy opportunity_requests_select on public.opportunity_requests
+  for select
+  using (
+    public.is_active_user()
+    and (requested_by = auth.uid() or public.is_admin() or public.is_supervisor())
+  );
+
 -- ---------------------------------------------------------------------
 -- 7. FUNCTION EXECUTE PERMISSIONS
 -- Only logged-in ("authenticated") users may call these functions.
@@ -329,12 +722,31 @@ grant execute on function public.is_admin() to authenticated;
 
 revoke execute on function public.is_active_user() from public, anon;
 grant execute on function public.is_active_user() to authenticated;
+
+revoke execute on function public.is_supervisor() from public, anon;
+grant execute on function public.is_supervisor() to authenticated;
+
+revoke execute on function public.request_amendment(uuid, text, text) from public, anon;
+grant execute on function public.request_amendment(uuid, text, text) to authenticated;
+
+revoke execute on function public.request_void(uuid, text) from public, anon;
+grant execute on function public.request_void(uuid, text) to authenticated;
+
+revoke execute on function public.review_request(uuid, text, text) from public, anon;
+grant execute on function public.review_request(uuid, text, text) to authenticated;
+
+revoke execute on function public.cancel_opportunity(uuid, text) from public, anon;
+grant execute on function public.cancel_opportunity(uuid, text) to authenticated;
 -- =====================================================================
 -- Expected result after running this file:
---   - Tables profiles, opportunity_sequences, opportunities exist.
---   - Functions is_admin, is_active_user, generate_opportunity_id,
---     void_opportunity exist.
+--   - Tables profiles, opportunity_sequences, opportunities,
+--     opportunity_requests exist.
+--   - Functions is_admin, is_active_user, is_supervisor,
+--     generate_opportunity_id, void_opportunity, request_amendment,
+--     request_void, review_request, cancel_opportunity exist.
 --   - Constraint opportunities_id_format_chk exists on opportunities.
+--   - profiles.role now accepts 'consultant', 'supervisor', 'admin'.
+--   - opportunities.status now accepts 'Active', 'Cancelled', 'Void'.
 --   - "Success. No rows returned" is shown in the SQL Editor.
 --   - New IDs generated after this point look like "M2600001" (8
 --     characters), not the older "MTT26-000123" style.
